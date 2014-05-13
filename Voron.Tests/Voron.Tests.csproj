@@ -53,12 +53,10 @@
     <Reference Include="System.Data" />
     <Reference Include="System.Xml" />
     <Reference Include="WindowsBase" />
-
     <Reference Include="xunit">
       <HintPath>..\..\SharedLibs\xunit\xunit.dll</HintPath>
     </Reference>
     <Reference Include="xunit.extensions">
-
       <HintPath>..\..\SharedLibs\xunit\xunit.extensions.dll</HintPath>
     </Reference>
   </ItemGroup>
@@ -88,6 +86,7 @@
     <Compile Include="DebugJournalTest.cs" />
     <Compile Include="Journal\BasicActions.cs" />
     <Compile Include="Journal\EdgeCases.cs" />
+    <Compile Include="Journal\LogShipping.cs" />
     <Compile Include="Journal\Mvcc.cs" />
     <Compile Include="Journal\UncommittedTransactions.cs" />
     <Compile Include="MultiValueTree.cs" />
@@ -119,6 +118,7 @@
     <Compile Include="Util\CrcTests.cs" />
     <Compile Include="Util\ImmutableAppendOnlyTests.cs" />
     <Compile Include="Util\StreamExtensions.cs" />
+    <Compile Include="Util\UnmanagedVectorMemoryStreamTests.cs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Voron\Voron.csproj">
