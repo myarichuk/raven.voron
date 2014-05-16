@@ -47,6 +47,14 @@ namespace Voron.Trees
 			_currentPage = _tree.FindPageFor(_tx, key, out lazy);
 			_cursor = lazy.Value;
 			_cursor.Pop();
+
+			//if required prefix is set and need to seek to beginning/end
+			//--> skip to beginning of relevant keys
+			if (RequiredPrefix != null &&
+			    !RequiredPrefix.Equals(Slice.Empty) &&
+			   (key.Equals(Slice.BeforeAllKeys) || key.Equals(Slice.AfterAllKeys)))
+				key = RequiredPrefix;
+
 			var node = _currentPage.Search(key, _cmp);
 			if (node == null)
 			{
