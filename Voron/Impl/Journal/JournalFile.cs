@@ -7,8 +7,12 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security;
 using System.Threading;
+using System.Threading.Tasks;
 using Voron.Impl.Paging;
 using Voron.Trees;
 using Voron.Util;
@@ -90,7 +94,7 @@ namespace Voron.Impl.Journal
 
 #if DEBUG
             Trace.WriteLine(
-                "Disposing a journal file from finalizer! It should be diposed by using JournalFile.Release() instead!. Log file number: " +
+                "Disposing a journal file from finalizer! It should be disposed by using JournalFile.Release() instead!. Log file number: " +
                 Number + ". Number of references: " + _refs + " " + _st);
 #endif
         }
@@ -164,10 +168,7 @@ namespace Voron.Impl.Journal
             return _journalWriter.Read(pos, (byte*)txHeader, sizeof(TransactionHeader));
         }
 
-		/// <summary>
-		/// write transaction's raw page data into journal. returns write page position
-		/// </summary>
-        public long Write(Transaction tx, byte*[] pages)
+        public void Write(Transaction tx, byte*[] pages)
         {
             var txPages = tx.GetTransactionPages();
 
@@ -184,13 +185,10 @@ namespace Voron.Impl.Journal
                 _unusedPages.AddRange(unused);
             }
 
-	        var position = writePagePos * AbstractPager.PageSize;
-	        _journalWriter.WriteGather(position, pages);
-
-			return writePagePos;
+            _journalWriter.WriteGather(writePagePos * AbstractPager.PageSize, pages);
         }
 
-	    private void UpdatePageTranslationTable(Transaction tx, List<PageFromScratchBuffer> txPages, HashSet<PagePosition> unused, Dictionary<long, PagePosition> ptt)
+	    private unsafe void UpdatePageTranslationTable(Transaction tx, List<PageFromScratchBuffer> txPages, HashSet<PagePosition> unused, Dictionary<long, PagePosition> ptt)
 	    {
 		    for (int index = 1; index < txPages.Count; index++)
 		    {
@@ -201,9 +199,8 @@ namespace Voron.Impl.Journal
 			    if (_pageTranslationTable.TryGetValue(tx, pageNumber, out value))
 				    unused.Add(value);
 
-			    PagePosition position;
-			    if (ptt.TryGetValue(pageNumber, out position))
-                    unused.Add(position);
+                if (ptt.ContainsKey(pageNumber))
+                    unused.Add(ptt[pageNumber]);
 
 			    ptt[pageNumber] = new PagePosition
 			    {

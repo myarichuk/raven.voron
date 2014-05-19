@@ -38,6 +38,7 @@ namespace Voron.Impl.Paging
 		}
 
 		public Win32MemoryMapPager(string file,
+			long? initialFileSize = null,
 			NativeFileAttributes options = NativeFileAttributes.Normal,
 			NativeFileAccess access = NativeFileAccess.GenericRead | NativeFileAccess.GenericWrite)
 		{
@@ -51,7 +52,6 @@ namespace Voron.Impl.Paging
 				? MemoryMappedFileAccess.Read
 				: MemoryMappedFileAccess.ReadWrite;
 
-			Trace.WriteLine(string.Format("creating/opening file (name = {0}), access type = {1}", file, _memoryMappedFileAccess));
 			_handle = NativeFileMethods.CreateFile(file, access,
 			   NativeFileShare.Read | NativeFileShare.Write | NativeFileShare.Delete, IntPtr.Zero,
 			   NativeFileCreationDisposition.OpenAlways, options, IntPtr.Zero);
@@ -75,14 +75,17 @@ namespace Voron.Impl.Paging
 				_access.HasFlag(NativeFileAccess.GenericAll) ||
 				_access.HasFlag(NativeFileAccess.FILE_GENERIC_WRITE))
 			{
-				long fileLengthAfterAdjustment = _fileStream.Length;
-				if (_fileStream.Length == 0 || (_fileStream.Length%AllocationGranularity != 0))
+				var fileLength = _fileStream.Length;
+				if (fileLength == 0 && initialFileSize.HasValue)
+					fileLength = initialFileSize.Value;
+
+				if (_fileStream.Length == 0 || (fileLength % AllocationGranularity != 0))
 				{
-					fileLengthAfterAdjustment = NearestSizeToAllocationGranularity(_fileInfo.Length);
-					_fileStream.SetLength(fileLengthAfterAdjustment);
+					fileLength = NearestSizeToAllocationGranularity(fileLength);
+					_fileStream.SetLength(fileLength);
 				}
 
-				_totalAllocationSize = fileLengthAfterAdjustment;
+				_totalAllocationSize = fileLength;
 			}
 
 			NumberOfAllocatedPages = _totalAllocationSize / PageSize;
@@ -102,6 +105,8 @@ namespace Voron.Impl.Paging
 
 		public override void AllocateMorePages(Transaction tx, long newLength)
 		{
+			ThrowObjectDisposedIfNeeded();
+
 			var newLengthAfterAdjustment = NearestSizeToAllocationGranularity(newLength);
 
 			if (newLengthAfterAdjustment < _totalAllocationSize)
@@ -136,8 +141,9 @@ namespace Voron.Impl.Paging
 					tx.AddPagerState(newPagerState);
 				}
 
-				PagerState.Release(); //replacing the pager state --> so one less reference for it
+				var tmp = PagerState;
 				PagerState = newPagerState;
+				tmp.Release(); //replacing the pager state --> so one less reference for it
 			}
 
 			_totalAllocationSize += allocationSize;
@@ -239,11 +245,15 @@ namespace Voron.Impl.Paging
 
 		public override byte* AcquirePagePointer(long pageNumber, PagerState pagerState = null)
 		{
+			ThrowObjectDisposedIfNeeded();
+
 			return (pagerState ?? PagerState).MapBase + (pageNumber*PageSize);
 		}
 
 		public override void Sync()
 		{
+			ThrowObjectDisposedIfNeeded();
+
 			if (PagerState.AllocationInfos.Any(allocationInfo => 
 				MemoryMapNativeMethods.FlushViewOfFile(allocationInfo.BaseAddress, new IntPtr(allocationInfo.Size)) == false))
 					throw new Win32Exception();
@@ -268,6 +278,8 @@ namespace Voron.Impl.Paging
 
 		public override int WriteDirect(Page start, long pagePosition, int pagesToWrite)
 		{
+			ThrowObjectDisposedIfNeeded();
+
 			int toCopy = pagesToWrite*PageSize;
 			NativeMethods.memcpy(PagerState.MapBase + pagePosition*PageSize, start.Base, toCopy);
 
@@ -276,6 +288,9 @@ namespace Voron.Impl.Paging
 
 		public override void Dispose()
 		{
+		    if (Disposed)
+		        return;
+
 			_fileStream.Dispose();
 			_handle.Close();
 			if (DeleteOnClose)

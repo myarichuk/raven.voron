@@ -80,7 +80,8 @@ namespace Voron.Impl.Paging
 
 			Debug.Assert(_fileStream.Length == newLength);
 
-            PagerState.Release(); // when the last transaction using this is over, will dispose it
+			var tmp = PagerState;
+
             PagerState newPager = CreateNewPagerState();
 
             if (tx != null) // we only pass null during startup, and we don't need it there
@@ -90,6 +91,7 @@ namespace Voron.Impl.Paging
             }
 
             PagerState = newPager;
+			tmp.Release(); // when the last transaction using this is over, will dispose it
             NumberOfAllocatedPages = newLength / PageSize;
         }
 
@@ -184,6 +186,8 @@ namespace Voron.Impl.Paging
 
         public override void Dispose()
         {
+            if (Disposed)
+                return;
             base.Dispose();
       
             _fileStream.Dispose();

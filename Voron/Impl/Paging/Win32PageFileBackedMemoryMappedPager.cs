@@ -14,18 +14,24 @@ namespace Voron.Impl.Paging
 {
 	public unsafe class Win32PageFileBackedMemoryMappedPager : AbstractPager
 	{
+		private readonly string _name;
 		public readonly long AllocationGranularity;
 		private long _totalAllocationSize;
 		private const int MaxAllocationRetries = 100;
+	    private static int _counter;
+	    private readonly int _instanceId;
 
 
-		public Win32PageFileBackedMemoryMappedPager()
+	    public Win32PageFileBackedMemoryMappedPager(string name, long? initialFileSize = null)
 		{
-			NativeMethods.SYSTEM_INFO systemInfo;
+		    _name = name;
+		    NativeMethods.SYSTEM_INFO systemInfo;
 			NativeMethods.GetSystemInfo(out systemInfo);
 
 			AllocationGranularity = systemInfo.allocationGranularity;
-			_totalAllocationSize = systemInfo.allocationGranularity;
+			_totalAllocationSize = initialFileSize.HasValue ? NearestSizeToAllocationGranularity(initialFileSize.Value) : systemInfo.allocationGranularity;
+
+		    _instanceId = Interlocked.Increment(ref _counter);
 
 			PagerState.Release();
 			Debug.Assert(AllocationGranularity % PageSize == 0);
@@ -35,7 +41,7 @@ namespace Voron.Impl.Paging
 
 		protected override string GetSourceName()
 		{
-			return "MemMapInSystemPage, Size : " + _totalAllocationSize;
+			return "MemMapInSystemPage: " +  _name  + " " + _instanceId + ", Size : " + _totalAllocationSize;
 		}
 
 		public override byte* AcquirePagePointer(long pageNumber, PagerState pagerState = null)
@@ -53,6 +59,7 @@ namespace Voron.Impl.Paging
 		{
 			long startPage = pageNumber ?? page.PageNumber;
 
+			//note: GetNumberOfOverflowPages and WriteDirect can throw ObjectDisposedException if the pager is already disposed
 			int toWrite = page.IsOverflow ? GetNumberOfOverflowPages(page.OverflowSize) : 1;
 
 			return WriteDirect(page, startPage, toWrite);
@@ -60,6 +67,7 @@ namespace Voron.Impl.Paging
 
 		public override void AllocateMorePages(Transaction tx, long newLength)
 		{
+			ThrowObjectDisposedIfNeeded();
 			var newLengthAfterAdjustment = NearestSizeToAllocationGranularity(newLength);
 
 			if (newLengthAfterAdjustment < _totalAllocationSize)
@@ -95,8 +103,9 @@ namespace Voron.Impl.Paging
                 // we always share the same memory mapped files references between all pages, since to close them 
                 // would be to lose all the memory assoicated with them
 		        PagerState.DisposeFilesOnDispose = false;
-		        PagerState.Release(); //replacing the pager state --> so one less reference for it
-		        PagerState = newPagerState;
+		        var tmp = PagerState;
+                PagerState = newPagerState;
+                tmp.Release(); //replacing the pager state --> so one less reference for it
 		    }
 
 		    _totalAllocationSize += allocationSize;
@@ -106,6 +115,8 @@ namespace Voron.Impl.Paging
 	
 		public override int WriteDirect(Page start, long pagePosition, int pagesToWrite)
 		{
+			ThrowObjectDisposedIfNeeded();
+
 			int toCopy = pagesToWrite * PageSize;
 			NativeMethods.memcpy(PagerState.MapBase + pagePosition * PageSize, start.Base, toCopy);
 
@@ -128,7 +139,7 @@ namespace Voron.Impl.Paging
 				{
 					var message =
 						string.Format(
-							"Unable to allocate more pages - unsucsessfully tried to allocate continuous block of size = {0} bytes\r\n" +
+							"Unable to allocate more pages - unsuccessfully tried to allocate continuous block of size = {0} bytes\r\n" +
 							"It is likely that we are suffering from virtual memory exhaustion or memory fragmentation.\r\n" +
 							"64 bits process: {1}\r\n" +
 							"If you are running in 32 bits, this is expected, and you need to run in 64 bits to resume normal operations.\r\n" +
@@ -150,7 +161,7 @@ namespace Voron.Impl.Paging
 
 					if (newAlloctedBaseAddress == null || newAlloctedBaseAddress == (byte*)0)
 					{
-						Trace.WriteLine("Failed to remap file continuously. Unmapping already mapped files and re-trying");
+						Debug.WriteLine("Failed to remap file continuously. Unmapping already mapped files and re-trying");
 						UndoMappings(allocationInfoAfterReallocation);
 						failedToAllocate = true;
 						break;

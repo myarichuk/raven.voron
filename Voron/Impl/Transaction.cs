@@ -2,12 +2,14 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading.Tasks;
 using Voron.Exceptions;
 using Voron.Impl.FileHeaders;
 using Voron.Impl.FreeSpace;
 using Voron.Impl.Journal;
 using Voron.Impl.Paging;
 using Voron.Trees;
+using Voron.Util;
 
 namespace Voron.Impl
 {
@@ -53,6 +55,7 @@ namespace Voron.Impl
 		private TransactionHeader* _txHeader;
 		private readonly List<PageFromScratchBuffer> _transactionPages = new List<PageFromScratchBuffer>();
 	    private readonly Dictionary<string, Tree> _trees = new Dictionary<string, Tree>();
+	    private readonly PagerState _scratchPagerState;
 
 	    public bool Committed { get; private set; }
 
@@ -75,13 +78,15 @@ namespace Voron.Impl
 			_id = id;
 			_freeSpaceHandling = freeSpaceHandling;
 			Flags = flags;
-
             var scratchPagerState = env.ScratchBufferPool.PagerState;
             scratchPagerState.AddRef();
             _pagerStates.Add(scratchPagerState);
-
 			if (flags.HasFlag(TransactionFlags.ReadWrite) == false)
 			{
+                // for read transactions, we need to keep the pager state frozen
+                // for write transactions, we can use the current one (which == null)
+			    _scratchPagerState = scratchPagerState;
+
 				_state = env.State;
 				_journal.GetSnapshots().ForEach(AddJournalSnapshot);
 				return;
@@ -94,28 +99,10 @@ namespace Voron.Impl
 			MarkTreesForWriteTransaction();
 		}
 
-		internal void WriteDirect(byte*[] pages)
-		{
-			foreach (var pageData in pages)
-			{
-				var allocation = _env.ScratchBufferPool.Allocate(this, 1);
-				var page = _env.ScratchBufferPool.ReadPage(allocation.PositionInScratchBuffer);
-				NativeMethods.memcpy(page.Base, pageData, AbstractPager.PageSize);
-				
-				page.Dirty = true;
-				_dirtyPages.Add(page.PageNumber);
-
-				_transactionPages.Add(allocation);
-				_allocatedPagesInTransaction++;
-				
-				
-			}
-		}
-
 		private void InitTransactionHeader()
 		{
 			var allocation = _env.ScratchBufferPool.Allocate(this, 1);
-			var page = _env.ScratchBufferPool.ReadPage(allocation.PositionInScratchBuffer);
+			var page = _env.ScratchBufferPool.ReadPage(allocation.PositionInScratchBuffer, _scratchPagerState);
 			_transactionPages.Add(allocation);
 			NativeMethods.memset(page.Base, 0, AbstractPager.PageSize);
 			_txHeader = (TransactionHeader*)page.Base;
@@ -201,11 +188,11 @@ namespace Voron.Impl
 		    Page p;
 			if (_scratchPagesTable.TryGetValue(pageNumber, out value))
 			{
-			    p = _env.ScratchBufferPool.ReadPage(value.PositionInScratchBuffer);
+			    p = _env.ScratchBufferPool.ReadPage(value.PositionInScratchBuffer, _scratchPagerState);
 			}
 			else
 			{
-			    p =  _journal.ReadPage(this, pageNumber) ?? _dataPager.Read(pageNumber);
+			    p =  _journal.ReadPage(this, pageNumber, _scratchPagerState) ?? _dataPager.Read(pageNumber);
 			}
 
             Debug.Assert(p != null && p.PageNumber == pageNumber, string.Format("Requested ReadOnly page #{0}. Got #{1} from {2}", pageNumber, p.PageNumber, p.Source));
@@ -372,7 +359,7 @@ namespace Voron.Impl
 		{
 			if (!Committed && !RolledBack && Flags == TransactionFlags.ReadWrite)
 				Rollback();
-			
+
 			_env.TransactionCompleted(this);
 			foreach (var pagerState in _pagerStates)
 			{

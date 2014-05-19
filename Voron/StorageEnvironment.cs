@@ -45,9 +45,7 @@ namespace Voron
 	    private EndOfDiskSpaceEvent _endOfDiskSpace;
 	    private int _sizeOfUnflushedTransactionsInJournalFile;
 
-
-	    public TemporaryPage TemporaryPage { get; private set; }
-
+		private Queue<TemporaryPage> _tempPagesPool = new Queue<TemporaryPage>(); 
 
         public TransactionMergingWriter Writer { get; private set; }
 
@@ -66,7 +64,7 @@ namespace Voron
 			
 			if(Writer != null)
 				Writer.Dispose();
-			Writer = new TransactionMergingWriter(this, DebugJournal);
+            Writer = new TransactionMergingWriter(this, _cancellationTokenSource.Token, DebugJournal);
 	    }
 #endif
 
@@ -74,10 +72,9 @@ namespace Voron
         {
             try
             {
-                TemporaryPage = new TemporaryPage();
                 _options = options;
                 _dataPager = options.DataPager;
-                _freeSpaceHandling = new FreeSpaceHandling(this);
+                _freeSpaceHandling = new FreeSpaceHandling();
                 _sliceComparer = NativeMethods.memcmp;
                 _headerAccessor = new HeaderAccessor(this);
                 var isNew = _headerAccessor.Initialize();
@@ -94,7 +91,7 @@ namespace Voron
                 State.FreeSpaceRoot.Name = Constants.FreeSpaceTreeName;
                 State.Root.Name = Constants.RootTreeName;
 
-                Writer = new TransactionMergingWriter(this);
+                Writer = new TransactionMergingWriter(this, _cancellationTokenSource.Token);
 
                 if (_options.ManualFlushing == false)
                     _flushingTask = FlushWritesToDataFileAsync();
@@ -221,7 +218,7 @@ namespace Voron
 			    if (Writer != null && value != null)
 			    {
 				    Writer.Dispose();
-				    Writer = new TransactionMergingWriter(this, _debugJournal);
+                    Writer = new TransactionMergingWriter(this, _cancellationTokenSource.Token, _debugJournal);
 			    }
 
 		    }
@@ -291,9 +288,10 @@ namespace Voron
 
             try
             {
-                if (_flushingTask != null)
+	            var flushingTaskCopy = _flushingTask;
+	            if (flushingTaskCopy != null)
                 {
-                    switch (_flushingTask.Status)
+                    switch (flushingTaskCopy.Status)
                     {
                         case TaskStatus.RanToCompletion:
                         case TaskStatus.Canceled:
@@ -301,17 +299,16 @@ namespace Voron
                         default:
                             try
                             {
-                                _flushingTask.Wait();
+                                flushingTaskCopy.Wait();
                             }
                             catch (AggregateException ae)
                             {
-	                            if (ae.InnerException is OperationCanceledException == false)
-		                            throw ae.InnerException;
+                                if (ae.InnerException is OperationCanceledException == false)
+                                    throw;
                             }
                             break;
                     }
                 }
-
             }
             finally
             {
@@ -322,8 +319,8 @@ namespace Voron
                     _headerAccessor,
                     _scratchBufferPool,
                     _options.OwnsPagers ? _options : null,
-                    _journal, TemporaryPage
-                })
+                    _journal
+                }.Concat(_tempPagesPool))
                 {
                     try
                     {
@@ -360,7 +357,8 @@ namespace Voron
 					{
 						if (_endOfDiskSpace.CanContinueWriting)
 						{
-							Debug.Assert(_flushingTask.Status == TaskStatus.Canceled || _flushingTask.Status == TaskStatus.RanToCompletion);
+							var flushingTask = _flushingTask;
+							Debug.Assert(flushingTask != null && (flushingTask.Status == TaskStatus.Canceled || flushingTask.Status == TaskStatus.RanToCompletion));
 							_cancellationTokenSource = new CancellationTokenSource();
 							_flushingTask = FlushWritesToDataFileAsync();
 							_endOfDiskSpace = null;
@@ -368,14 +366,13 @@ namespace Voron
                     }
                 }
 
-                long txId;
-                Transaction tx;
+	            Transaction tx;
 
                 _txCommit.EnterReadLock();
                 try
                 {
-                    txId = flags == TransactionFlags.ReadWrite ? _transactionsCounter + 1 : _transactionsCounter;
-                    tx = new Transaction(this, txId, flags, _freeSpaceHandling);
+	                long txId = flags == TransactionFlags.ReadWrite ? _transactionsCounter + 1 : _transactionsCounter;
+	                tx = new Transaction(this, txId, flags, _freeSpaceHandling);
                 }
                 finally
                 {
@@ -460,7 +457,6 @@ namespace Voron
 
 			return new EnvironmentStats
 			{
-				FreePages = _freeSpaceHandling.GetFreePageCount(),
 				FreePagesOverhead = State.FreeSpaceRoot.State.PageCount,
 				RootPages = State.Root.State.PageCount,
 				UnallocatedPagesAtEndOfFile = _dataPager.NumberOfAllocatedPages - NextPageNumber,
@@ -500,7 +496,7 @@ namespace Voron
 
 				            try
 				            {
-				                _journal.Applicator.ApplyLogsToDataFile(OldestTransaction);
+                                _journal.Applicator.ApplyLogsToDataFile(OldestTransaction, _cancellationTokenSource.Token);
 				            }
 				            catch (TimeoutException)
 				            {
@@ -516,15 +512,16 @@ namespace Voron
             if (_options.ManualFlushing == false)
                 throw new NotSupportedException("Manual flushes are not set in the storage options, cannot manually flush!");
 
-           _journal.Applicator.ApplyLogsToDataFile(OldestTransaction, tx);
+           _journal.Applicator.ApplyLogsToDataFile(OldestTransaction, _cancellationTokenSource.Token, tx);
         }
 
         public void AssertFlushingNotFailed()
         {
-            if (_flushingTask == null || _flushingTask.IsFaulted == false)
+	        var flushingTaskCopy = _flushingTask;
+	        if (flushingTaskCopy == null || flushingTaskCopy.IsFaulted == false)
                 return;
 
-            _flushingTask.Wait();// force re-throw of error
+            flushingTaskCopy.Wait();// force re-throw of error
         }
 
 	    public void HandleDataDiskFullException(DiskFullException exception)
@@ -534,6 +531,53 @@ namespace Voron
 
 		    _cancellationTokenSource.Cancel();
 			_endOfDiskSpace = new EndOfDiskSpaceEvent(exception.DriveInfo);
+	    }
+
+	    public IDisposable GetTemporaryPage(Transaction tx, out TemporaryPage tmp)
+	    {
+		    if (tx.Flags != TransactionFlags.ReadWrite)
+			    throw new ArgumentException("Temporary pages are only available for write transactions");
+		    if (_tempPagesPool.Count > 0)
+		    {
+			    tmp = _tempPagesPool.Dequeue();
+			    return tmp.ReturnTemporaryPageToPool;
+		    }
+
+			tmp = new TemporaryPage();
+		    try
+		    {
+			    return tmp.ReturnTemporaryPageToPool = new ReturnTemporaryPageToPool(this, tmp);
+		    }
+		    catch (Exception)
+		    {
+			    tmp.Dispose();
+			    throw;
+		    }
+	    }
+
+	    private class ReturnTemporaryPageToPool : IDisposable
+	    {
+		    private readonly TemporaryPage _tmp;
+		    private readonly StorageEnvironment _env;
+
+		    public ReturnTemporaryPageToPool(StorageEnvironment env, TemporaryPage tmp)
+		    {
+			    _tmp = tmp;
+			    _env = env;
+		    }
+
+		    public void Dispose()
+		    {
+			    try
+			    {
+				    _env._tempPagesPool.Enqueue(_tmp);
+			    }
+			    catch (Exception)
+			    {
+					_tmp.Dispose();
+				    throw;
+			    }
+		    }
 	    }
     }
 }
